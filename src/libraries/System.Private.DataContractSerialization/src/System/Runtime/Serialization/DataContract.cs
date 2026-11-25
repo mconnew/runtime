@@ -25,7 +25,7 @@ namespace System.Runtime.Serialization.DataContracts
     /// <summary>
     /// Represents a data contract that defines serialization and deserialization behavior for types.
     /// </summary>
-    public abstract class DataContract
+    public abstract partial class DataContract
     {
         internal const string SerializerTrimmerWarning = "Data Contract Serialization and Deserialization might require types that cannot be statically analyzed. Make sure all of the " +
             "required types are preserved.";
@@ -1108,8 +1108,11 @@ namespace System.Runtime.Serialization.DataContracts
             }
         }
 
+        // Null System.Type members still require validation of their declared type and its base contract.
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
         [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        [DynamicDependency("#ctor()", typeof(Type))]
+        [DynamicDependency("#ctor()", typeof(MemberInfo))]
         internal static bool IsTypeSerializable(Type type)
         {
             return IsTypeSerializable(type, null);

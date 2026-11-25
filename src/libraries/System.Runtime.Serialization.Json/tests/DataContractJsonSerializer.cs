@@ -7,6 +7,7 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -14,13 +15,779 @@ using System.Reflection;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Linq;
+using System.Xml.Schema;
+using System.Xml.Serialization;
 using Xunit;
 using System.Runtime.Serialization.Tests;
 
+#if AsyncApi
+[ConditionalClass(typeof(PlatformDetection), nameof(PlatformDetection.IsMultithreadingSupported))]
+#endif
 public static partial class DataContractJsonSerializerTests
 {
+    public static IEnumerable<object[]> AsyncPrimitiveValues()
+    {
+        yield return new object[] { typeof(bool), true };
+        yield return new object[] { typeof(sbyte), sbyte.MinValue };
+        yield return new object[] { typeof(byte), byte.MaxValue };
+        yield return new object[] { typeof(short), short.MinValue };
+        yield return new object[] { typeof(ushort), ushort.MaxValue };
+        yield return new object[] { typeof(int), int.MinValue };
+        yield return new object[] { typeof(uint), uint.MaxValue };
+        yield return new object[] { typeof(long), long.MinValue };
+        yield return new object[] { typeof(ulong), ulong.MaxValue };
+        yield return new object[] { typeof(float), 1.25f };
+        yield return new object[] { typeof(double), -1.25d };
+        yield return new object[] { typeof(decimal), decimal.MaxValue };
+        yield return new object[] { typeof(char), '\u6f22' };
+        yield return new object[] { typeof(string), new string('x', 4096) + "\u6f22\ud83d\ude42" };
+        yield return new object[] { typeof(string), null };
+        yield return new object[] { typeof(DateTime), new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc) };
+        yield return new object[] { typeof(Guid), new Guid("38af611b-57c3-4bd4-877b-d5ea2a2025f8") };
+        yield return new object[] { typeof(TimeSpan), TimeSpan.FromSeconds(-12.5) };
+        yield return new object[] { typeof(Uri), new Uri("relative/path", UriKind.Relative) };
+        yield return new object[] { typeof(XmlQualifiedName), new XmlQualifiedName("name", "urn:async") };
+        yield return new object[] { typeof(byte[]), new byte[] { 0, 128, 255 } };
+        yield return new object[] { typeof(byte[]), Array.Empty<byte>() };
+        yield return new object[] { typeof(byte[]), null };
+        yield return new object[] { typeof(int?), 17 };
+        yield return new object[] { typeof(int?), null };
+        yield return new object[] { typeof(TypeCode), TypeCode.Decimal };
+        yield return new object[] { typeof(ULongEnum), ULongEnum.Option2 };
+        yield return new object[] { typeof(ULongEnum), (ULongEnum)ulong.MaxValue };
+        yield return new object[] { typeof(object), 123 };
+    }
+
+    [Theory]
+    [MemberData(nameof(AsyncPrimitiveValues))]
+    public static async Task DCJS_AsyncPrimitiveOperations_UseAsyncExternalIo(Type type, object input)
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(type);
+        object output = await RoundTripJsonAsync(serializer, input);
+        if (input is byte[] bytes)
+        {
+            Assert.Equal(bytes, Assert.IsType<byte[]>(output));
+        }
+        else
+        {
+            Assert.Equal(input, output);
+        }
+    }
+
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, false)]
+    [InlineData(64, false)]
+    [InlineData(513, false)]
+    [InlineData(0, true)]
+    [InlineData(1, true)]
+    [InlineData(64, true)]
+    [InlineData(513, true)]
+    public static async Task DCJS_AsyncPrimitiveArrays_PreserveBufferedAndIndentedOutput(int count, bool indent)
+    {
+        int[] numbers = Enumerable.Range(0, count).Select(i => i % 2 == 0 ? int.MinValue : int.MaxValue).ToArray();
+        object[] arrays =
+        {
+            numbers,
+            numbers.Select(i => (long)i * int.MaxValue).ToArray(),
+            numbers.Select(i => (byte)i).ToArray(),
+            numbers.Select(i => i < 0).ToArray(),
+            numbers.Select(i => (decimal)i / 7).ToArray(),
+            numbers.Select(i => (float)i / 7).ToArray(),
+            numbers.Select(i => (double)i / 7).ToArray(),
+            numbers.Select(i => new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc).AddTicks(i)).ToArray()
+        };
+        foreach (object value in arrays)
+        {
+            DataContractJsonSerializer serializer = new DataContractJsonSerializer(value.GetType());
+            using MemoryStream expected = new MemoryStream();
+            using (XmlDictionaryWriter baseline = JsonReaderWriterFactory.CreateJsonWriter(expected, Encoding.UTF8, ownsStream: false, indent))
+            {
+                serializer.WriteObject(baseline, value);
+                baseline.Flush();
+            }
+            using AsyncOnlyJsonStream output = new AsyncOnlyJsonStream();
+            XmlDictionaryWriter writer = JsonReaderWriterFactory.CreateJsonWriter(output, Encoding.UTF8, ownsStream: false, indent);
+            await serializer.WriteObjectAsync(writer, value);
+            await writer.FlushAsync();
+
+            Assert.Equal(expected.ToArray(), output.Bytes);
+            Assert.True(output.WriteCalls > 0);
+            await writer.DisposeAsync();
+        }
+    }
+
+    [Theory]
+    [InlineData("[1e2,-2.0,2147483647,-2147483648]", typeof(int[]))]
+    [InlineData("[1e12,-2.0,9223372036854775807,-9223372036854775808]", typeof(long[]))]
+    [InlineData("[1e2,-2.25,79228162514264337593543950335]", typeof(decimal[]))]
+    [InlineData("[0,255,1e2]", typeof(byte[]))]
+    [InlineData("[0,4294967295,1e2]", typeof(uint[]))]
+    [InlineData("[true,false,true]", typeof(bool[]))]
+    [InlineData("[1.25,-2.5,1e2]", typeof(double[]))]
+    [InlineData("[\"1e2\",\"-2.0\",\"\\u0033\"]", typeof(int[]))]
+    [InlineData("[\"\", \"plain\", \"\\u6f22\", \"escaped\\\"quote\", null]", typeof(string[]))]
+    [InlineData("[\"\\/Date(0)\\/\",\"\\b\\f\\n\\r\\t\\\"\\\\\\/\",\"\\uD83D\\uDE00\",\"prefix\\u6f22suffix\"]", typeof(string[]))]
+    [InlineData("[\"\\/Date(0)\\/\",\"\\/Date(123456789)\\/\"]", typeof(DateTime[]))]
+    [InlineData("[1 \r\n, -2.0 \t, true , false]", typeof(string[]))]
+    [InlineData("[true \r\n, false \t, true ]", typeof(bool[]))]
+    [InlineData("[1 \r\n, -2 \t, 3 ]", typeof(int[]))]
+    public static async Task DCJS_AsyncBufferedPrimitiveArrays_MatchSynchronousNumbers(string json, Type type)
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(type);
+        byte[] bytes = Encoding.UTF8.GetBytes(json);
+        using MemoryStream synchronous = new MemoryStream(bytes);
+        object expected = serializer.ReadObject(synchronous);
+        foreach (int fragmentSize in new[] { 1, 2, 6, 12, 13, 4096 })
+        {
+            using AsyncOnlyJsonStream asynchronous = new AsyncOnlyJsonStream(bytes, fragmentSize);
+            Assert.Equal(expected, await serializer.ReadObjectAsync(asynchronous));
+            Assert.True(asynchronous.ReadCalls > 0);
+        }
+    }
+
+    [Theory]
+    [InlineData("[2147483648]", typeof(int[]))]
+    [InlineData("[1.5]", typeof(int[]))]
+    [InlineData("[9223372036854775808]", typeof(long[]))]
+    [InlineData("[79228162514264337593543950336]", typeof(decimal[]))]
+    [InlineData("[256]", typeof(byte[]))]
+    [InlineData("[4294967296]", typeof(uint[]))]
+    [InlineData("[trueX]", typeof(bool[]))]
+    [InlineData("[1x]", typeof(int[]))]
+    [InlineData("[\"\\q\"]", typeof(string[]))]
+    [InlineData("[\"\\uZZZZ\"]", typeof(string[]))]
+    [InlineData("[\"\\uD83D\\u0041\"]", typeof(string[]))]
+    [InlineData("[\"\uFFFE\"]", typeof(string[]))]
+    public static async Task DCJS_AsyncBufferedPrimitiveArrays_RejectInvalidValues(string json, Type type)
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(type);
+        byte[] bytes = Encoding.UTF8.GetBytes(json);
+        using MemoryStream synchronous = new MemoryStream(bytes);
+        Assert.Throws<SerializationException>(() => serializer.ReadObject(synchronous));
+        foreach (int fragmentSize in new[] { 1, 2, 6, 12, 13, 4096 })
+        {
+            using AsyncOnlyJsonStream asynchronous = new AsyncOnlyJsonStream(bytes, fragmentSize);
+            await Assert.ThrowsAsync<SerializationException>(() => serializer.ReadObjectAsync(asynchronous));
+        }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public static async Task DCJS_CompiledDictionaryInsertion_PreservesNullValues(bool simple, bool referenceValue)
+    {
+        Type type = referenceValue ? typeof(Dictionary<int, string>) : typeof(Dictionary<string, int?>);
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(type,
+            new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = simple });
+        string text = referenceValue
+            ? simple ? "{\"1\":null,\"2\":\"value\"}" : "[{\"Key\":1,\"Value\":null},{\"Key\":2,\"Value\":\"value\"}]"
+            : simple ? "{\"empty\":null,\"value\":17}" : "[{\"Key\":\"empty\",\"Value\":null},{\"Key\":\"value\",\"Value\":17}]";
+        byte[] encoded = Encoding.UTF8.GetBytes(text);
+        using MemoryStream synchronous = new MemoryStream(encoded);
+        using AsyncOnlyJsonStream asynchronous = new AsyncOnlyJsonStream(encoded);
+        foreach (object result in new[] { serializer.ReadObject(synchronous), await serializer.ReadObjectAsync(asynchronous) })
+        {
+            if (referenceValue)
+            {
+                Dictionary<int, string> dictionary = Assert.IsType<Dictionary<int, string>>(result);
+                Assert.Equal(2, dictionary.Count);
+                Assert.Null(dictionary[1]);
+                Assert.Equal("value", dictionary[2]);
+            }
+            else
+            {
+                Dictionary<string, int?> dictionary = Assert.IsType<Dictionary<string, int?>>(result);
+                Assert.Equal(2, dictionary.Count);
+                Assert.Null(dictionary["empty"]);
+                Assert.Equal(17, dictionary["value"]);
+            }
+        }
+        Assert.True(asynchronous.ReadCalls > 0);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public static async Task DCJS_AsyncClassOperations_MapNamesAndReuseCachedGraphs(bool optional)
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(CompiledJsonDerived));
+        for (int i = 0; i < 3; i++)
+        {
+            CompiledJsonDerived input = new CompiledJsonDerived
+            {
+                BaseValue = i + 10,
+                Value = new CompiledJsonValue { Number = i, Optional = optional ? i : null },
+                Text = new string('x', 2048) + "\u6f22\ud83d\ude42"
+            };
+            CompiledJsonDerived output = (CompiledJsonDerived)await RoundTripJsonAsync(serializer, input);
+            Assert.Equal(input.BaseValue, output.BaseValue);
+            Assert.Equal(input.Value.Number, output.Value.Number);
+            Assert.Equal(input.Value.Optional, output.Value.Optional);
+            Assert.Equal(input.Text, output.Text);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public static async Task DCJS_AsyncAdapterOperations_MatchSynchronousOutput(bool customDateTimeFormat)
+    {
+        DateTimeOffset[] offsets =
+        {
+            new DateTimeOffset(2020, 1, 2, 3, 4, 5, TimeSpan.Zero),
+            new DateTimeOffset(2020, 1, 2, 3, 4, 5, TimeSpan.FromHours(-5)),
+            new DateTimeOffset(2020, 1, 2, 3, 4, 5, TimeSpan.FromHours(5.5))
+        };
+        List<DateTimeOffset> values = Enumerable.Range(0, 128).Select(index => offsets[index % offsets.Length]).ToList();
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(List<DateTimeOffset>),
+            new DataContractJsonSerializerSettings { DateTimeFormat = customDateTimeFormat ? new DateTimeFormat("O", CultureInfo.InvariantCulture) : null });
+        using MemoryStream expected = new MemoryStream();
+        serializer.WriteObject(expected, values);
+        using AsyncOnlyJsonStream output = new AsyncOnlyJsonStream();
+        await serializer.WriteObjectAsync(output, values);
+        Assert.Equal(expected.ToArray(), output.Bytes);
+        using AsyncOnlyJsonStream input = new AsyncOnlyJsonStream(output.Bytes);
+        Assert.Equal(values, Assert.IsType<List<DateTimeOffset>>(await serializer.ReadObjectAsync(input)));
+        Assert.True(output.WriteCalls > 1);
+        Assert.True(input.ReadCalls > 0);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public static async Task DCJS_AsyncDateTimeMembers_PreserveFormatsAndBufferBoundaries(bool customDateTimeFormat)
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(AsyncDateTimeMembers),
+            new DataContractJsonSerializerSettings { DateTimeFormat = customDateTimeFormat ? new DateTimeFormat("O", CultureInfo.InvariantCulture) : null });
+        DateTime[] values =
+        {
+            DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Utc),
+            DateTime.SpecifyKind(DateTime.MaxValue, DateTimeKind.Utc),
+            new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc),
+            new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Local),
+            new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Unspecified)
+        };
+        foreach (DateTime date in values)
+        {
+            AsyncDateTimeMembers value = new AsyncDateTimeMembers { Padding = new string('x', 480), Date = date };
+            using MemoryStream expected = new MemoryStream();
+            serializer.WriteObject(expected, value);
+            using AsyncOnlyJsonStream output = new AsyncOnlyJsonStream();
+            await serializer.WriteObjectAsync(output, value);
+
+            Assert.Equal(expected.ToArray(), output.Bytes);
+            Assert.True(output.WriteCalls > 1);
+        }
+    }
+
+    [DataContract]
+    private sealed class AsyncDateTimeMembers
+    {
+        [DataMember(Order = 0)] public string Padding { get; set; }
+        [DataMember(Order = 1)] public DateTime Date { get; set; }
+    }
+
+    [Theory]
+    [InlineData("\u0001")]
+    [InlineData("\ud800")]
+    [InlineData("\u2028")]
+    [InlineData("\"/\\\n")]
+    public static async Task DCJS_AsyncEscapedMembers_KeepBufferReservationsBounded(string text)
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(AsyncEscapedMembers[]));
+        for (int length = 0; length <= 32; length++)
+        {
+            AsyncEscapedMembers value = new AsyncEscapedMembers { Padding = new string('x', length), Value = text };
+            AsyncEscapedMembers[] values = new AsyncEscapedMembers[128];
+            Array.Fill(values, value);
+            using MemoryStream expected = new MemoryStream();
+            serializer.WriteObject(expected, values);
+            using AsyncOnlyJsonStream output = new AsyncOnlyJsonStream();
+            await serializer.WriteObjectAsync(output, values);
+
+            Assert.Equal(expected.ToArray(), output.Bytes);
+        }
+    }
+
+    [DataContract]
+    private sealed class AsyncEscapedMembers
+    {
+        [DataMember(Name = "p", Order = 0)] public string Padding { get; set; }
+        [DataMember(Name = "v", Order = 1)] public string Value { get; set; }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public static async Task DCJS_AsyncDictionaryOperations_UsePerSerializerLayout(bool firstSimple)
+    {
+        DataContractJsonSerializer first = new DataContractJsonSerializer(typeof(IDictionary<string, int?>), new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = firstSimple });
+        DataContractJsonSerializer second = new DataContractJsonSerializer(typeof(IDictionary<string, int?>), new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = !firstSimple });
+        foreach (int count in new[] { 0, 1, 65 })
+        {
+            Dictionary<string, int?> input = Enumerable.Range(0, count).ToDictionary(i => i.ToString(CultureInfo.InvariantCulture), i => i % 3 == 0 ? (int?)null : i);
+            foreach (DataContractJsonSerializer serializer in new[] { first, second, first })
+            {
+                IDictionary<string, int?> output = (IDictionary<string, int?>)await RoundTripJsonAsync(serializer, input);
+                Assert.Equal(input.OrderBy(pair => pair.Key), output.OrderBy(pair => pair.Key));
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public static async Task DCJS_CompiledCollectionModes_UseBoundDictionaryFormat(bool firstSimple)
+    {
+        DataContractJsonSerializer first = new DataContractJsonSerializer(typeof(CompiledJsonCollectionModes),
+            new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = firstSimple });
+        DataContractJsonSerializer second = new DataContractJsonSerializer(typeof(CompiledJsonCollectionModes),
+            new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = !firstSimple });
+        foreach (int count in new[] { 0, 1, 65 })
+        {
+            CompiledJsonCollectionModes input = new CompiledJsonCollectionModes
+            {
+                Normal = Enumerable.Range(0, count).ToDictionary(i => i.ToString(CultureInfo.InvariantCulture), i => i + 10),
+                NormalArray = Enumerable.Range(0, count).ToArray()
+            };
+            foreach (KeyValuePair<string, int> item in input.Normal)
+            {
+                input.GetOnly.Add(item.Key, item.Value);
+            }
+            input.GetOnlyArray[0] = count;
+            input.GetOnlyArray[1] = count + 1;
+            foreach (DataContractJsonSerializer serializer in new[] { first, second, first })
+            {
+                CompiledJsonCollectionModes output = Assert.IsType<CompiledJsonCollectionModes>(await RoundTripJsonAsync(serializer, input));
+                Assert.Equal(input.Normal.OrderBy(item => item.Key), output.Normal.OrderBy(item => item.Key));
+                Assert.Equal(input.GetOnly.OrderBy(item => item.Key), output.GetOnly.OrderBy(item => item.Key));
+                Assert.Equal(input.NormalArray, output.NormalArray);
+                Assert.Equal(input.GetOnlyArray, output.GetOnlyArray);
+            }
+        }
+    }
+
+    [DataContract]
+    private sealed class CompiledJsonCollectionModes
+    {
+        private Dictionary<string, int> _getOnly;
+        private int[] _getOnlyArray;
+
+        [DataMember] public Dictionary<string, int> Normal { get; set; }
+        [DataMember] public Dictionary<string, int> GetOnly => _getOnly ??= new Dictionary<string, int>();
+        [DataMember] public int[] NormalArray { get; set; }
+        [DataMember] public int[] GetOnlyArray => _getOnlyArray ??= new int[2];
+    }
+
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(false, 1)]
+    [InlineData(false, 2)]
+    [InlineData(false, 3)]
+    [InlineData(true, 0)]
+    [InlineData(true, 1)]
+    [InlineData(true, 2)]
+    [InlineData(true, 3)]
+    public static async Task DCJS_CompiledMemberBitmap_PreservesBoundaryValidation(bool large, int mutation)
+    {
+        Type type = large ? typeof(CompiledJsonLargeBitmap) : typeof(CompiledJsonBitmap);
+        CompiledJsonBitmap input = large ? new CompiledJsonLargeBitmap { P64 = 65 } : new CompiledJsonBitmap();
+        input.P00 = 1;
+        input.P63 = 64;
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(type);
+        using MemoryStream expected = new MemoryStream();
+        serializer.WriteObject(expected, input);
+        string json = Encoding.UTF8.GetString(expected.ToArray());
+        string last = large ? nameof(CompiledJsonLargeBitmap.P64) : nameof(CompiledJsonBitmap.P63);
+        if (mutation is 1 or 2)
+        {
+            string duplicate = mutation is 1 ? nameof(CompiledJsonBitmap.P00) : last;
+            json = json.Substring(0, json.Length - 1) + ",\"" + duplicate + "\":42}";
+        }
+        else if (mutation is 3)
+        {
+            string member = ",\"" + last + "\":" + (large ? "65" : "64");
+            Assert.Contains(member, json);
+            json = json.Replace(member, string.Empty);
+        }
+        using MemoryStream synchronous = new MemoryStream(Encoding.UTF8.GetBytes(json));
+        using AsyncOnlyJsonStream asynchronous = new AsyncOnlyJsonStream(Encoding.UTF8.GetBytes(json));
+        if (mutation is not 0)
+        {
+            Assert.Throws<SerializationException>(() => serializer.ReadObject(synchronous));
+            await Assert.ThrowsAsync<SerializationException>(() => serializer.ReadObjectAsync(asynchronous));
+        }
+        else
+        {
+            foreach (CompiledJsonBitmap output in new[]
+            {
+                Assert.IsAssignableFrom<CompiledJsonBitmap>(serializer.ReadObject(synchronous)),
+                Assert.IsAssignableFrom<CompiledJsonBitmap>(await serializer.ReadObjectAsync(asynchronous))
+            })
+            {
+                Assert.Equal(input.P00, output.P00);
+                Assert.Equal(input.P63, output.P63);
+                if (large)
+                {
+                    Assert.Equal(65, Assert.IsType<CompiledJsonLargeBitmap>(output).P64);
+                }
+            }
+        }
+    }
+
+    [DataContract]
+    private class CompiledJsonBitmap
+    {
+        [DataMember] public int P00 { get; set; }
+        [DataMember] public int P01 { get; set; }
+        [DataMember] public int P02 { get; set; }
+        [DataMember] public int P03 { get; set; }
+        [DataMember] public int P04 { get; set; }
+        [DataMember] public int P05 { get; set; }
+        [DataMember] public int P06 { get; set; }
+        [DataMember] public int P07 { get; set; }
+        [DataMember] public int P08 { get; set; }
+        [DataMember] public int P09 { get; set; }
+        [DataMember] public int P10 { get; set; }
+        [DataMember] public int P11 { get; set; }
+        [DataMember] public int P12 { get; set; }
+        [DataMember] public int P13 { get; set; }
+        [DataMember] public int P14 { get; set; }
+        [DataMember] public int P15 { get; set; }
+        [DataMember] public int P16 { get; set; }
+        [DataMember] public int P17 { get; set; }
+        [DataMember] public int P18 { get; set; }
+        [DataMember] public int P19 { get; set; }
+        [DataMember] public int P20 { get; set; }
+        [DataMember] public int P21 { get; set; }
+        [DataMember] public int P22 { get; set; }
+        [DataMember] public int P23 { get; set; }
+        [DataMember] public int P24 { get; set; }
+        [DataMember] public int P25 { get; set; }
+        [DataMember] public int P26 { get; set; }
+        [DataMember] public int P27 { get; set; }
+        [DataMember] public int P28 { get; set; }
+        [DataMember] public int P29 { get; set; }
+        [DataMember] public int P30 { get; set; }
+        [DataMember] public int P31 { get; set; }
+        [DataMember] public int P32 { get; set; }
+        [DataMember] public int P33 { get; set; }
+        [DataMember] public int P34 { get; set; }
+        [DataMember] public int P35 { get; set; }
+        [DataMember] public int P36 { get; set; }
+        [DataMember] public int P37 { get; set; }
+        [DataMember] public int P38 { get; set; }
+        [DataMember] public int P39 { get; set; }
+        [DataMember] public int P40 { get; set; }
+        [DataMember] public int P41 { get; set; }
+        [DataMember] public int P42 { get; set; }
+        [DataMember] public int P43 { get; set; }
+        [DataMember] public int P44 { get; set; }
+        [DataMember] public int P45 { get; set; }
+        [DataMember] public int P46 { get; set; }
+        [DataMember] public int P47 { get; set; }
+        [DataMember] public int P48 { get; set; }
+        [DataMember] public int P49 { get; set; }
+        [DataMember] public int P50 { get; set; }
+        [DataMember] public int P51 { get; set; }
+        [DataMember] public int P52 { get; set; }
+        [DataMember] public int P53 { get; set; }
+        [DataMember] public int P54 { get; set; }
+        [DataMember] public int P55 { get; set; }
+        [DataMember] public int P56 { get; set; }
+        [DataMember] public int P57 { get; set; }
+        [DataMember] public int P58 { get; set; }
+        [DataMember] public int P59 { get; set; }
+        [DataMember] public int P60 { get; set; }
+        [DataMember] public int P61 { get; set; }
+        [DataMember] public int P62 { get; set; }
+        [DataMember(IsRequired = true)] public int P63 { get; set; }
+    }
+
+    [DataContract]
+    private sealed class CompiledJsonLargeBitmap : CompiledJsonBitmap
+    {
+        [DataMember(IsRequired = true)] public int P64 { get; set; }
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public static async Task DCJS_AsyncEmptyCollections_AllowRootOnlyGraphQuota(int kind)
+    {
+        object input = kind switch
+        {
+            0 => Array.Empty<int>(),
+            1 => new List<int>(),
+            2 => new Dictionary<string, int>(),
+            _ => throw new ArgumentOutOfRangeException(nameof(kind))
+        };
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(input.GetType(), new DataContractJsonSerializerSettings { MaxItemsInObjectGraph = 1 });
+        Assert.Empty((IEnumerable)await RoundTripJsonAsync(serializer, input));
+    }
+
+    [Theory]
+    [InlineData("{\"A\":3,\"unknown\":\"ignored\",\"C\":9}", false)]
+    [InlineData("{\"A\":3}", true)]
+    [InlineData("{\"A\":3,\"C\":9,\"A\":4}", true)]
+    public static async Task DCJS_AsyncMembers_ValidateRequiredAndDuplicateMembers(string json, bool invalid)
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(CompiledRequiredJsonMembers));
+        using AsyncOnlyJsonStream stream = new AsyncOnlyJsonStream(Encoding.UTF8.GetBytes(json));
+        if (invalid)
+        {
+            await Assert.ThrowsAsync<SerializationException>(() => serializer.ReadObjectAsync(stream));
+        }
+        else
+        {
+            CompiledRequiredJsonMembers value = (CompiledRequiredJsonMembers)await serializer.ReadObjectAsync(stream);
+            Assert.Equal(3, value.A);
+            Assert.Equal(0, value.B);
+            Assert.Equal(9, value.C);
+            Assert.NotNull(value.ExtensionData);
+            using AsyncOnlyJsonStream rewritten = new AsyncOnlyJsonStream();
+            await serializer.WriteObjectAsync(rewritten, value);
+            Assert.Contains("\"unknown\":\"ignored\"", Encoding.UTF8.GetString(rewritten.Bytes));
+        }
+    }
+
+    [Fact]
+    public static async Task DCJS_AsyncCustomXml_TransfersIndividualXmlValue()
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(AsyncJsonXmlValue));
+        AsyncJsonXmlValue input = new AsyncJsonXmlValue { Text = new string('x', 4096) + "\u6f22\ud83d\ude42" };
+        AsyncJsonXmlValue output = (AsyncJsonXmlValue)await RoundTripJsonAsync(serializer, input);
+        Assert.Equal(input.Text, output.Text);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    [DynamicDependency("CreateJsonReaderAsync", "System.Runtime.Serialization.Json.JsonReaderWriterFactory", "System.Private.DataContractSerialization")]
+    public static async Task DCJS_IsStartObjectAsync_UsesTrueAsyncExternalIo(bool dictionaryOverload)
+    {
+        using CancellationTokenSource source = new CancellationTokenSource();
+        using AsyncOnlyJsonStream stream = new AsyncOnlyJsonStream(Encoding.UTF8.GetBytes(new string(' ', 16384) + "\"value\""));
+        MethodInfo factory = typeof(JsonReaderWriterFactory).GetMethod("CreateJsonReaderAsync", BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(factory);
+        XmlDictionaryReader reader = await (ValueTask<XmlDictionaryReader>)factory.Invoke(null, new object[] { stream, Encoding.UTF8, XmlDictionaryReaderQuotas.Max, null, source.Token });
+        try
+        {
+            int before = stream.ReadCalls;
+            DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(string));
+            bool result = dictionaryOverload ? await serializer.IsStartObjectAsync(reader, source.Token) : await serializer.IsStartObjectAsync((XmlReader)reader, source.Token);
+            Assert.True(result);
+            Assert.True(stream.ReadCalls > before);
+            Assert.Equal(source.Token, stream.LastReadToken);
+            Assert.Equal(XmlNodeType.Element, reader.NodeType);
+            Assert.Equal("value", await serializer.ReadObjectAsync(reader, source.Token));
+            Assert.NotEqual(ReadState.Closed, reader.ReadState);
+            Assert.False(stream.Disposed);
+        }
+        finally
+        {
+            await CloseJsonReaderAsync(reader);
+        }
+        Assert.Equal(ReadState.Closed, reader.ReadState);
+    }
+
+    [DynamicDependency("CloseAsync", "System.Runtime.Serialization.Json.XmlJsonReader", "System.Private.DataContractSerialization")]
+    private static ValueTask CloseJsonReaderAsync(XmlDictionaryReader reader)
+    {
+        MethodInfo close = reader.GetType().GetMethod("CloseAsync", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(close);
+        return (ValueTask)close.Invoke(reader, null);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public static async Task DCJS_AsyncExternalIo_ObservesCancellation(bool read)
+    {
+        using CancellationTokenSource source = new CancellationTokenSource();
+        using AsyncOnlyJsonStream stream = new AsyncOnlyJsonStream(Encoding.UTF8.GetBytes("\"value\"")) { BlockIo = true };
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(string));
+        Task operation = read ? serializer.ReadObjectAsync(stream, source.Token) : serializer.WriteObjectAsync(stream, "value", source.Token);
+        Assert.False(operation.IsCompleted);
+        source.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation);
+        Assert.Equal(source.Token, read ? stream.LastReadToken : stream.LastWriteToken);
+        Assert.False(stream.Disposed);
+    }
+
+    [Fact]
+    public static async Task DCJS_AsyncOperation_CapturesDateTimeStylesBeforeSuspension()
+    {
+        DateTimeFormat format = new DateTimeFormat("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture)
+        {
+            DateTimeStyles = DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal
+        };
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(DateTime), new DataContractJsonSerializerSettings { DateTimeFormat = format });
+        byte[] json = Encoding.UTF8.GetBytes("\"2020-01-02T03:04:05\"");
+        using AsyncOnlyJsonStream stream = new AsyncOnlyJsonStream(json) { GateFirstIo = true };
+        Task<object> operation = serializer.ReadObjectAsync(stream);
+        await stream.IoStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        format.DateTimeStyles = DateTimeStyles.None;
+        stream.ResumeIo.TrySetResult(true);
+        DateTime output = (DateTime)await operation;
+        Assert.Equal(new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc), output);
+        Assert.Equal(DateTimeKind.Utc, output.Kind);
+        using AsyncOnlyJsonStream later = new AsyncOnlyJsonStream(json);
+        Assert.Equal(DateTimeKind.Unspecified, ((DateTime)await serializer.ReadObjectAsync(later)).Kind);
+    }
+
+    private static async Task<object> RoundTripJsonAsync(DataContractJsonSerializer serializer, object input)
+    {
+        using CancellationTokenSource source = new CancellationTokenSource();
+        using AsyncOnlyJsonStream output = new AsyncOnlyJsonStream();
+        await serializer.WriteObjectAsync(output, input, source.Token);
+        Assert.True(output.WriteCalls > 0);
+        Assert.Equal(source.Token, output.LastWriteToken);
+        Assert.False(output.Disposed);
+        using AsyncOnlyJsonStream inputStream = new AsyncOnlyJsonStream(output.Bytes);
+        object value = await serializer.ReadObjectAsync(inputStream, source.Token);
+        Assert.True(inputStream.ReadCalls > 0);
+        Assert.Equal(source.Token, inputStream.LastReadToken);
+        Assert.False(inputStream.Disposed);
+        return value;
+    }
+
+    private sealed class AsyncJsonXmlValue : IXmlSerializable
+    {
+        public string Text { get; set; }
+        public XmlSchema GetSchema() => null;
+        public void WriteXml(XmlWriter writer) => writer.WriteElementString("text", Text);
+        public void ReadXml(XmlReader reader)
+        {
+            reader.ReadStartElement();
+            reader.MoveToContent();
+            Text = reader.ReadElementContentAsString();
+            reader.ReadEndElement();
+        }
+    }
+
+    private sealed class AsyncOnlyJsonStream : Stream
+    {
+        private readonly MemoryStream _memory;
+        private readonly int _fragmentSize = int.MaxValue;
+        private int _gatedIo;
+        internal bool BlockIo { get; set; }
+        internal bool GateFirstIo { get; set; }
+        internal TaskCompletionSource<bool> IoStarted { get; } = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource<bool> ResumeIo { get; } = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal bool Disposed { get; private set; }
+        internal int ReadCalls { get; private set; }
+        internal int WriteCalls { get; private set; }
+        internal CancellationToken LastReadToken { get; private set; }
+        internal CancellationToken LastWriteToken { get; private set; }
+        internal byte[] Bytes => _memory.ToArray();
+        internal AsyncOnlyJsonStream() => _memory = new MemoryStream();
+        internal AsyncOnlyJsonStream(byte[] bytes, int fragmentSize = int.MaxValue)
+        {
+            _memory = new MemoryStream(bytes);
+            _fragmentSize = fragmentSize;
+        }
+        public override bool CanRead => true;
+        public override bool CanWrite => true;
+        public override bool CanSeek => false;
+        public override long Length => _memory.Length;
+        public override long Position { get => _memory.Position; set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int count) => throw new InvalidOperationException("Synchronous read.");
+        public override void Write(byte[] buffer, int offset, int count) => throw new InvalidOperationException("Synchronous write.");
+        public override void Flush() => throw new InvalidOperationException("Synchronous flush.");
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken token) => ReadAsync(buffer.AsMemory(offset, count), token).AsTask();
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken token) => WriteAsync(buffer.AsMemory(offset, count), token).AsTask();
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken token = default)
+        {
+            ReadCalls++;
+            LastReadToken = token;
+            await Task.Yield();
+            await PauseFirstIo(token);
+            if (BlockIo)
+            {
+                await Task.Delay(Timeout.Infinite, token);
+            }
+            token.ThrowIfCancellationRequested();
+            return _memory.Read(buffer.Span.Slice(0, Math.Min(buffer.Length, _fragmentSize)));
+        }
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken token = default)
+        {
+            WriteCalls++;
+            LastWriteToken = token;
+            await Task.Yield();
+            await PauseFirstIo(token);
+            if (BlockIo)
+            {
+                await Task.Delay(Timeout.Infinite, token);
+            }
+            token.ThrowIfCancellationRequested();
+            _memory.Write(buffer.Span);
+        }
+        public override async Task FlushAsync(CancellationToken token)
+        {
+            await Task.Yield();
+            token.ThrowIfCancellationRequested();
+        }
+        private async Task PauseFirstIo(CancellationToken token)
+        {
+            if (GateFirstIo && Interlocked.Increment(ref _gatedIo) == 1)
+            {
+                IoStarted.TrySetResult(true);
+                await ResumeIo.Task.WaitAsync(token);
+            }
+        }
+        protected override void Dispose(bool disposing)
+        {
+            Disposed = true;
+            if (disposing)
+            {
+                _memory.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    [Theory]
+    [InlineData("{\"A\":3,\"unknown\":\"ignored\",\"C\":9}", false)]
+    [InlineData("{\"A\":3}", true)]
+    [InlineData("{\"A\":3,\"C\":9,\"A\":4}", true)]
+    public static void DCJS_CompiledMembers_ValidateRequiredAndDuplicateMembers(string json, bool invalid)
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(CompiledRequiredJsonMembers));
+        using MemoryStream stream = new MemoryStream(Encoding.UTF8.GetBytes(json));
+        if (invalid)
+        {
+            Assert.Throws<SerializationException>(() => serializer.TestReadObject(stream));
+        }
+        else
+        {
+            CompiledRequiredJsonMembers value = (CompiledRequiredJsonMembers)serializer.TestReadObject(stream);
+            Assert.Equal(3, value.A);
+            Assert.Equal(0, value.B);
+            Assert.Equal(9, value.C);
+            Assert.NotNull(value.ExtensionData);
+        }
+    }
+
+    [DataContract]
+    private sealed class CompiledRequiredJsonMembers : IExtensibleDataObject
+    {
+        [DataMember(Order = 0, IsRequired = true)] public int A { get; set; }
+        [DataMember(Order = 1)] public int B { get; set; }
+        [DataMember(Order = 2, IsRequired = true)] public int C { get; set; }
+        public ExtensionDataObject ExtensionData { get; set; }
+    }
+
 #if ReflectionOnly
     private static readonly string SerializationOptionSetterName = "set_Option";
 
@@ -31,6 +798,122 @@ public static partial class DataContractJsonSerializerTests
         method.Invoke(null, new object[] { 1 });
     }
 #endif
+#if ReflectionOnly
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public static void DCJS_ArrayDictionary_DoesNotDiscoverSimpleKeyParsing(bool populated)
+    {
+        Dictionary<AmbiguousParseKey, int> input = new Dictionary<AmbiguousParseKey, int>();
+        if (populated)
+        {
+            input.Add(new AmbiguousParseKey { Number = 7 }, 11);
+        }
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(Dictionary<AmbiguousParseKey, int>));
+        using MemoryStream stream = new MemoryStream();
+        serializer.TestWriteObject(stream, input);
+        stream.Position = 0;
+        Dictionary<AmbiguousParseKey, int> output = (Dictionary<AmbiguousParseKey, int>)serializer.TestReadObject(stream);
+        Assert.Equal(input.Count, output.Count);
+        if (populated)
+        {
+            Assert.Equal(7, output.Single().Key.Number);
+            Assert.Equal(11, output.Single().Value);
+        }
+    }
+
+    [DataContract]
+    private class AmbiguousParseKey
+    {
+        [DataMember]
+        public int Number { get; set; }
+
+        public static AmbiguousParseKey Parse<T>(string value) => new AmbiguousParseKey();
+        public static AmbiguousParseKey Parse<T, TSecond>(string value) => new AmbiguousParseKey();
+    }
+#endif
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public static void DCJS_CompiledClassOperations_MapInheritedMemberNames(bool optional)
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(CompiledJsonDerived));
+        for (int i = 0; i < 3; i++)
+        {
+            CompiledJsonDerived input = new CompiledJsonDerived
+            {
+                BaseValue = i + 10,
+                Value = new CompiledJsonValue { Number = i, Optional = optional ? i : null },
+                Text = $"value {i}"
+            };
+            using MemoryStream stream = new MemoryStream();
+            serializer.TestWriteObject(stream, input);
+            string json = Encoding.UTF8.GetString(stream.ToArray());
+            Assert.Contains("\"base\":", json);
+            Assert.Contains("\"child:name\":", json);
+            Assert.Contains("\"raw\\\"name\":", json);
+
+            stream.Position = 0;
+            CompiledJsonDerived output = (CompiledJsonDerived)serializer.TestReadObject(stream);
+            Assert.Equal(input.BaseValue, output.BaseValue);
+            Assert.Equal(input.Value.Number, output.Value.Number);
+            Assert.Equal(input.Value.Optional, output.Value.Optional);
+            Assert.Equal(input.Text, output.Text);
+        }
+    }
+
+    [DataContract]
+    private class CompiledJsonBase
+    {
+        [DataMember(Name = "base", Order = 0)]
+        public int BaseValue { get; set; }
+    }
+
+    [DataContract]
+    private class CompiledJsonDerived : CompiledJsonBase
+    {
+        [DataMember(Name = "child:name", Order = 1)]
+        public CompiledJsonValue Value { get; set; }
+
+        [DataMember(Name = "raw\"name", Order = 2)]
+        public string Text { get; set; } = string.Empty;
+    }
+
+    [DataContract]
+    private struct CompiledJsonValue
+    {
+        [DataMember]
+        public int Number { get; set; }
+
+        [DataMember]
+        public int? Optional { get; set; }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public static void DCJS_CompiledDictionaryOperations_UsePerSerializerFormat(bool firstSimple)
+    {
+        DataContractJsonSerializer first = new DataContractJsonSerializer(typeof(IDictionary<string, int?>), new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = firstSimple });
+        DataContractJsonSerializer second = new DataContractJsonSerializer(typeof(IDictionary<string, int?>), new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = !firstSimple });
+        foreach (int count in new[] { 0, 1, 65 })
+        {
+            Dictionary<string, int?> input = Enumerable.Range(0, count)
+                .ToDictionary(index => index.ToString(CultureInfo.InvariantCulture), index => index % 3 is 0 ? (int?)null : index);
+            foreach (DataContractJsonSerializer serializer in new[] { first, second, first })
+            {
+                using MemoryStream stream = new MemoryStream();
+                serializer.TestWriteObject(stream, input);
+                string json = Encoding.UTF8.GetString(stream.ToArray());
+                Assert.StartsWith(serializer.UseSimpleDictionaryFormat ? "{" : "[", json);
+                stream.Position = 0;
+                IDictionary<string, int?> output = (IDictionary<string, int?>)serializer.TestReadObject(stream);
+                Assert.Equal(input.OrderBy(pair => pair.Key), output.OrderBy(pair => pair.Key));
+            }
+        }
+    }
+
     [Fact]
     public static void DCJS_BoolAsRoot()
     {
@@ -327,7 +1210,7 @@ public static partial class DataContractJsonSerializerTests
                         sw.Write(pair.text);
                         sw.Flush();
                         ms.Position = 0;
-                        string actual = (string)serializer.ReadObject(ms);
+                        string actual = (string)serializer.TestReadObject(ms);
                         Assert.Equal(pair.value, actual);
                     }
                 }
@@ -1094,7 +1977,7 @@ public static partial class DataContractJsonSerializerTests
                 writer.Flush();
                 ms.Position = 0;
 
-                obj = (TypeWithSimpleDictionaryMember)serializer.ReadObject(ms);
+                obj = (TypeWithSimpleDictionaryMember)serializer.TestReadObject(ms);
             }
         }
 
@@ -1412,7 +2295,7 @@ public static partial class DataContractJsonSerializerTests
 
                 Assert.Throws<SerializationException>(() =>
                 {
-                    serializer.ReadObject(ms);
+                    serializer.TestReadObject(ms);
                 });
             }
         }
@@ -1448,12 +2331,12 @@ public static partial class DataContractJsonSerializerTests
         // Serialization-deserialization
         using (MemoryStream stream = new MemoryStream())
         {
-            dcjs.WriteObject(stream, obj);
+            dcjs.TestWriteObject(stream, obj);
             stream.Position = 0;
             var serializedStr = new StreamReader(stream).ReadToEnd();
 
             stream.Position = 0;
-            var obj2 = (TypeWithDateTimeStringProperty)dcjs.ReadObject(stream);
+            var obj2 = (TypeWithDateTimeStringProperty)dcjs.TestReadObject(stream);
             Assert.Equal(obj.DateTimeString, obj2.DateTimeString);
             Assert.Equal(obj.CurrentDateTime, obj2.CurrentDateTime);
         }
@@ -1466,7 +2349,7 @@ public static partial class DataContractJsonSerializerTests
             sw.WriteLine(@"{""DateTimeString"":""\/Date(1411072352108-0700)\/""}");
             sw.Flush();
             ms.Seek(0, SeekOrigin.Begin);
-            var result = (TypeWithDateTimeStringProperty)dcjs.ReadObject(ms);
+            var result = (TypeWithDateTimeStringProperty)dcjs.TestReadObject(ms);
             Assert.Equal(@"/Date(1411072352108-0700)/", result.DateTimeString);
         }
     }
@@ -1510,6 +2393,14 @@ public static partial class DataContractJsonSerializerTests
     }
 
     [Fact]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Tuple<int>))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Tuple<int, int>))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Tuple<int, int, int>))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Tuple<int, int, int, int>))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Tuple<int, int, int, int, int>))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Tuple<int, int, int, int, int, int>))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Tuple<int, int, int, int, int, int, int>))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Tuple<int, int, int, int, int, int, int, Tuple<int>>))]
     public static void DCJS_Tuple()
     {
         DCJS_Tuple1();
@@ -1579,6 +2470,7 @@ public static partial class DataContractJsonSerializerTests
     }
 
     [Fact]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Queue<int>))]
     public static void DCJS_GenericQueue()
     {
         Queue<int> value = new Queue<int>();
@@ -1592,6 +2484,7 @@ public static partial class DataContractJsonSerializerTests
     }
 
     [Fact]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Stack<int>))]
     public static void DCJS_GenericStack()
     {
         var value = new Stack<int>();
@@ -1607,6 +2500,7 @@ public static partial class DataContractJsonSerializerTests
     }
 
     [Fact]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Queue))]
     public static void DCJS_Queue()
     {
         var value = new Queue();
@@ -1621,6 +2515,7 @@ public static partial class DataContractJsonSerializerTests
     }
 
     [Fact]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(Stack))]
     public static void DCJS_Stack()
     {
         var value = new Stack();
@@ -1669,7 +2564,7 @@ public static partial class DataContractJsonSerializerTests
         stream.Seek(0, SeekOrigin.Begin);
 
         DataContractJsonSerializer dcjs = new DataContractJsonSerializer(typeof(object));
-        var deserializedValue = (object[])dcjs.ReadObject(stream);
+        var deserializedValue = (object[])dcjs.TestReadObject(stream);
         Assert.Equal(3, deserializedValue.Length);
         Assert.Equal("Foo", deserializedValue[0]);
         Assert.Equal(123, deserializedValue[1]);
@@ -1723,7 +2618,7 @@ public static partial class DataContractJsonSerializerTests
         var serializer = new DataContractJsonSerializer(typeof(object));
         Assert.Throws<SerializationException>(() =>
         {
-            serializer.ReadObject(new MemoryStream());
+            serializer.TestReadObject(new MemoryStream());
         });
     }
 
@@ -1743,6 +2638,24 @@ public static partial class DataContractJsonSerializerTests
     }
 
     [Fact]
+    public static async Task DCJS_UseSimpleDictionaryFormat_ReadsSynchronouslyAndAsynchronously()
+    {
+        DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(Dictionary<string, string>),
+            new DataContractJsonSerializerSettings { UseSimpleDictionaryFormat = true });
+        byte[] json = Encoding.UTF8.GetBytes("{\"first\":\"one\",\"second\":\"two\"}");
+        using MemoryStream syncStream = new MemoryStream(json);
+        using MemoryStream asyncStream = new MemoryStream(json);
+        Dictionary<string, string> sync = (Dictionary<string, string>)serializer.ReadObject(syncStream);
+        Dictionary<string, string> async = (Dictionary<string, string>)await serializer.ReadObjectAsync(asyncStream);
+        foreach (Dictionary<string, string> result in new[] { sync, async })
+        {
+            Assert.Equal(2, result.Count);
+            Assert.Equal("one", result["first"]);
+            Assert.Equal("two", result["second"]);
+        }
+    }
+
+    [Fact]
     public static void DCJS_DeserializeTypeWithInnerInvalidDataContract()
     {
         DataContractJsonSerializer dcjs = new DataContractJsonSerializer(typeof(TypeWithPropertyWithoutDefaultCtor));
@@ -1753,12 +2666,13 @@ public static partial class DataContractJsonSerializerTests
         sw.Flush();
         ms.Seek(0, SeekOrigin.Begin);
 
-        TypeWithPropertyWithoutDefaultCtor deserializedValue = (TypeWithPropertyWithoutDefaultCtor)dcjs.ReadObject(ms);
+        TypeWithPropertyWithoutDefaultCtor deserializedValue = (TypeWithPropertyWithoutDefaultCtor)dcjs.TestReadObject(ms);
         Assert.Equal("Foo", deserializedValue.Name);
         Assert.Null(deserializedValue.MemberWithInvalidDataContract);
     }
 
     [Fact]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(ReadOnlyCollection<string>))]
     public static void DCJS_ReadOnlyCollection()
     {
         List<string> list = new List<string>() { "Foo", "Bar" };
@@ -1770,6 +2684,7 @@ public static partial class DataContractJsonSerializerTests
     }
 
     [Fact]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(ReadOnlyDictionary<string, int>))]
     public static void DCJS_ReadOnlyDictionary()
     {
         var dict = new Dictionary<string, int>();
@@ -1860,7 +2775,7 @@ public static partial class DataContractJsonSerializerTests
     }
 
     [Fact]
-    public static void DCJS_TypeWithCollectionWithoutDefaultConstructor()
+    public static async Task DCJS_TypeWithCollectionWithoutDefaultConstructor()
     {
         TypeWithCollectionWithoutDefaultConstructor value = new TypeWithCollectionWithoutDefaultConstructor();
         value.CollectionProperty.Add("Foo");
@@ -1871,6 +2786,9 @@ public static partial class DataContractJsonSerializerTests
         Assert.NotNull(deserializedValue.CollectionProperty);
         Assert.Equal(value.CollectionProperty.Count, deserializedValue.CollectionProperty.Count);
         Assert.True(Enumerable.SequenceEqual(value.CollectionProperty, deserializedValue.CollectionProperty));
+        TypeWithCollectionWithoutDefaultConstructor asynchronous = Assert.IsType<TypeWithCollectionWithoutDefaultConstructor>(
+            await RoundTripJsonAsync(new DataContractJsonSerializer(typeof(TypeWithCollectionWithoutDefaultConstructor)), value));
+        Assert.Equal(value.CollectionProperty, asynchronous.CollectionProperty);
     }
 
     [Fact]
@@ -1939,7 +2857,7 @@ public static partial class DataContractJsonSerializerTests
     {
         Assert.Throws<InvalidDataContractException>(() =>
         {
-            (new DataContractJsonSerializer(typeof(RecursiveCollection))).WriteObject(new MemoryStream(), new RecursiveCollection());
+            (new DataContractJsonSerializer(typeof(RecursiveCollection))).TestWriteObject(new MemoryStream(), new RecursiveCollection());
         });
     }
 
@@ -2309,7 +3227,7 @@ public static partial class DataContractJsonSerializerTests
             XmlDictionaryWriter writer = JsonReaderWriterFactory.CreateJsonWriter(mo, Encoding.UTF8);
             var serializer = new DataContractJsonSerializer(typeof(Person1));
             var sr = new StreamReader(mo);
-            serializer.WriteObject(writer, p);
+            serializer.TestWriteObject(writer, p);
             writer.Flush();
             mo.Position = 0;
             var output = sr.ReadToEnd();
@@ -2337,7 +3255,7 @@ public static partial class DataContractJsonSerializerTests
         // Auto-detected encoding (no encoding specified). This is the scenario from the bug report.
         using (var stream = new MemoryStream(bytes))
         {
-            var result = (Person1)serializer.ReadObject(stream);
+            var result = (Person1)serializer.TestReadObject(stream);
             Assert.Equal(value.Name, result.Name);
             Assert.Equal(value.Age, result.Age);
         }
@@ -2346,7 +3264,7 @@ public static partial class DataContractJsonSerializerTests
         using (var stream = new MemoryStream(bytes))
         {
             XmlDictionaryReader reader = JsonReaderWriterFactory.CreateJsonReader(stream, encoding, XmlDictionaryReaderQuotas.Max, null);
-            var result = (Person1)serializer.ReadObject(reader);
+            var result = (Person1)serializer.TestReadObject(reader);
             Assert.Equal(value.Name, result.Name);
             Assert.Equal(value.Age, result.Age);
         }
@@ -2361,7 +3279,7 @@ public static partial class DataContractJsonSerializerTests
         byte[] bytes = GetJsonBytesWithByteOrderMark(serializer, value, encoding);
 
         XmlDictionaryReader reader = JsonReaderWriterFactory.CreateJsonReader(bytes, 0, bytes.Length, XmlDictionaryReaderQuotas.Max);
-        var result = (Person1)serializer.ReadObject(reader);
+        var result = (Person1)serializer.TestReadObject(reader);
         Assert.Equal(value.Name, result.Name);
         Assert.Equal(value.Age, result.Age);
     }
@@ -2371,7 +3289,7 @@ public static partial class DataContractJsonSerializerTests
         string json;
         using (var utf8Stream = new MemoryStream())
         {
-            serializer.WriteObject(utf8Stream, value);
+            serializer.TestWriteObject(utf8Stream, value);
             json = Encoding.UTF8.GetString(utf8Stream.ToArray());
         }
 
@@ -2431,7 +3349,7 @@ public static partial class DataContractJsonSerializerTests
         // Serialize the PersonV2 object
         var ser = new DataContractJsonSerializer(typeof(PersonV2));
         var ms1 = new MemoryStream();
-        ser.WriteObject(ms1, p2);
+        ser.TestWriteObject(ms1, p2);
 
         // Verify the payload
         ms1.Position = 0;
@@ -2452,7 +3370,7 @@ public static partial class DataContractJsonSerializerTests
         // Deserialize the payload into a Person instance.
         ms1.Position = 0;
         var ser2 = new DataContractJsonSerializer(typeof(Person));
-        var p1 = (Person)ser2.ReadObject(ms1);
+        var p1 = (Person)ser2.TestReadObject(ms1);
 
         Assert.True(p1 != null, $"Variable {nameof(p1)} was null.");
         Assert.True(p1.ExtensionData != null, $"{nameof(p1.ExtensionData)} was null.");
@@ -2460,7 +3378,7 @@ public static partial class DataContractJsonSerializerTests
 
         // Serialize the Person instance
         var ms2 = new MemoryStream();
-        ser2.WriteObject(ms2, p1);
+        ser2.TestWriteObject(ms2, p1);
 
         // Verify the payload
         ms2.Position = 0;
@@ -2490,20 +3408,20 @@ public static partial class DataContractJsonSerializerTests
         string extendedContractJson;
         using (var memoryStream = new MemoryStream())
         {
-            new DataContractJsonSerializer(typeof(ContractExtended)).WriteObject(memoryStream, extendedData);
+            new DataContractJsonSerializer(typeof(ContractExtended)).TestWriteObject(memoryStream, extendedData);
             extendedContractJson = Encoding.UTF8.GetString(memoryStream.ToArray());
         }
 
         ContractGeneric reducedData;
         using (var memoryStream = new MemoryStream(Encoding.UTF8.GetBytes(extendedContractJson)))
         {
-            reducedData = (ContractGeneric)new DataContractJsonSerializer(typeof(ContractGeneric)).ReadObject(memoryStream);
+            reducedData = (ContractGeneric)new DataContractJsonSerializer(typeof(ContractGeneric)).TestReadObject(memoryStream);
         }
 
         string reducedContractJson;
         using (var memoryStream = new MemoryStream())
         {
-            new DataContractJsonSerializer(typeof(ContractGeneric)).WriteObject(memoryStream, reducedData);
+            new DataContractJsonSerializer(typeof(ContractGeneric)).TestWriteObject(memoryStream, reducedData);
             reducedContractJson = Encoding.UTF8.GetString(memoryStream.ToArray());
         }
 
@@ -2517,7 +3435,7 @@ public static partial class DataContractJsonSerializerTests
             XmlDictionaryWriter w = JsonReaderWriterFactory.CreateJsonWriter(ms);
             w.WriteStartElement("root");
             w.WriteAttributeString("type", "object");
-            serializer.WriteObject(w, value);
+            serializer.TestWriteObject(w, value);
             w.WriteEndElement();
             w.Flush();
             return Encoding.Default.GetString(ms.ToArray());
@@ -2661,7 +3579,7 @@ public static partial class DataContractJsonSerializerTests
         };
         var serializer = new DataContractJsonSerializer(typeof(DateTime), dcjsSettings);
         var ms = new MemoryStream();
-        serializer.WriteObject(ms, original);
+        serializer.TestWriteObject(ms, original);
         var serializedJsonValue = Encoding.UTF8.GetString(ms.ToArray());
         serializedJsonValue = serializedJsonValue.Replace("2011", "         2011");
         Assert.Throws<SerializationException>(() => DeserializeString<DateTime>(serializedJsonValue));
@@ -3011,6 +3929,7 @@ public static partial class DataContractJsonSerializerTests
     }
 
     [Fact]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.NonPublicFields, typeof(ReadOnlyDictionary<string, int>))]
     public static void DCJS_ReadOnlyDictionaryCausingDuplicateInvalidDataContract()
     {
         var dict = new Dictionary<string, int>();
@@ -3033,7 +3952,7 @@ public static partial class DataContractJsonSerializerTests
                 object o = td.Instantiate();
                 DataContractJsonSerializer dcs = new DataContractJsonSerializer(o.GetType());
                 MemoryStream ms = new MemoryStream();
-                dcs.WriteObject(ms, o);
+                dcs.TestWriteObject(ms, o);
             });
         }
     }
@@ -3080,7 +3999,7 @@ public static partial class DataContractJsonSerializerTests
     public static void DCJS_DifferentCollectionsOfSameTypeAsKnownTypes()
     {
         Assert.Throws<InvalidOperationException>(() => {
-            (new DataContractSerializer(typeof(TypeWithKnownTypesOfCollectionsWithConflictingXmlName))).WriteObject(new MemoryStream(), new TypeWithKnownTypesOfCollectionsWithConflictingXmlName());
+            (new DataContractSerializer(typeof(TypeWithKnownTypesOfCollectionsWithConflictingXmlName))).TestWriteObject(new MemoryStream(), new TypeWithKnownTypesOfCollectionsWithConflictingXmlName());
         });
     }
 
@@ -3098,7 +4017,7 @@ public static partial class DataContractJsonSerializerTests
 
         using (MemoryStream ms = new MemoryStream())
         {
-            dcjs.WriteObject(ms, value);
+            dcjs.TestWriteObject(ms, value);
             ms.Position = 0;
 
             string actualOutput = new StreamReader(ms).ReadToEnd();
@@ -3112,7 +4031,7 @@ public static partial class DataContractJsonSerializerTests
             }
 
             ms.Position = 0;
-            T deserialized = (T)dcjs.ReadObject(ms);
+            T deserialized = (T)dcjs.TestReadObject(ms);
 
             return deserialized;
         }
@@ -3134,7 +4053,7 @@ public static partial class DataContractJsonSerializerTests
         using (MemoryStream ms = new MemoryStream(bytesToDeserialize))
         {
             ms.Position = 0;
-            T deserialized = (T)dcs.ReadObject(ms);
+            T deserialized = (T)dcs.TestReadObject(ms);
 
             return deserialized;
         }
@@ -3163,7 +4082,7 @@ public static partial class DataContractJsonSerializerTests
             {
                 writer = JsonReaderWriterFactory.CreateJsonWriter(ms, Encoding.UTF8, false, true);
             }
-            dcjs.WriteObject(writer, value);
+            dcjs.TestWriteObject(writer, value);
             writer.Flush();
             string actualOutput = Encoding.UTF8.GetString(ms.GetBuffer(), 0, (int)ms.Position);
             if (!skipStringCompare)
@@ -3173,7 +4092,7 @@ public static partial class DataContractJsonSerializerTests
                     Environment.NewLine, result.ErrorMessage, value, baseline, actualOutput));
             }
             ms.Position = 0;
-            T deserialized = (T)dcjs.ReadObject(ms);
+            T deserialized = (T)dcjs.TestReadObject(ms);
             return deserialized;
         }
     }
@@ -3206,9 +4125,9 @@ public static partial class DataContractJsonSerializerTests
                 new NonSerializablePerson("Bob", 5),
             }
         };
-        dcjs.WriteObject(ms, myFamily);
+        dcjs.TestWriteObject(ms, myFamily);
         ms.Position = 0;
-        var newFamily = (Family)dcjs.ReadObject(ms);
+        var newFamily = (Family)dcjs.TestReadObject(ms);
         Assert.Equal(myFamily.Members.Length, newFamily.Members.Length);
         for (int i = 0; i < myFamily.Members.Length; ++i)
         {
@@ -3238,7 +4157,7 @@ public static partial class DataContractJsonSerializerTests
                 stream1.WriteLine(TestFileData);
                 using (var memoryStream = new MemoryStream())
                 {
-                    dcjs.WriteObject(memoryStream, stream1);
+                    dcjs.TestWriteObject(memoryStream, stream1);
                     serializedStream = memoryStream.ToArray();
                 }
             }
@@ -3246,7 +4165,7 @@ public static partial class DataContractJsonSerializerTests
             // Deserialize the stream
             using (var stream = new MemoryStream(serializedStream))
             {
-                using (var stream2 = (MyFileStream)dcjs.ReadObject(stream))
+                using (var stream2 = (MyFileStream)dcjs.TestReadObject(stream))
                 {
                     string fileData = stream2.ReadLine();
                     Assert.Equal(TestFileData, fileData);

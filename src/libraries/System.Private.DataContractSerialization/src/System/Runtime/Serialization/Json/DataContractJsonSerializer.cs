@@ -13,6 +13,8 @@ using System.Runtime.Serialization;
 using System.Runtime.Serialization.DataContracts;
 using System.Security;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Xml;
 
 using DataContractDictionary = System.Collections.Generic.Dictionary<System.Xml.XmlQualifiedName, System.Runtime.Serialization.DataContracts.DataContract>;
@@ -104,8 +106,39 @@ namespace System.Runtime.Serialization.Json
 
         internal ISerializationSurrogateProvider? SerializationSurrogateProvider
         {
-            get { return _serializationSurrogateProvider; }
-            set { _serializationSurrogateProvider = value; }
+            get { return Volatile.Read(ref _serializationSurrogateProvider); }
+            set { Volatile.Write(ref _serializationSurrogateProvider, value); }
+        }
+
+        internal override DataContractJsonSerializer CreateAsyncOperationSnapshot()
+        {
+            DataContractJsonSerializer snapshot = new DataContractJsonSerializer(this, SerializationSurrogateProvider);
+            if (_dateTimeFormat is DateTimeFormat format)
+            {
+                snapshot._dateTimeFormat = new DateTimeFormat(format.FormatString, format.FormatProvider)
+                {
+                    DateTimeStyles = format.DateTimeStyles
+                };
+            }
+            return snapshot;
+        }
+
+        private DataContractJsonSerializer(DataContractJsonSerializer serializer, ISerializationSurrogateProvider? surrogateProvider)
+        {
+            knownTypeList = serializer.knownTypeList;
+            knownDataContracts = serializer.knownDataContracts;
+            _emitTypeInformation = serializer._emitTypeInformation;
+            _knownTypeCollection = serializer._knownTypeCollection;
+            _maxItemsInObjectGraph = serializer._maxItemsInObjectGraph;
+            _serializeReadOnlyTypes = serializer._serializeReadOnlyTypes;
+            _dateTimeFormat = serializer._dateTimeFormat;
+            _useSimpleDictionaryFormat = serializer._useSimpleDictionaryFormat;
+            _ignoreExtensionDataObject = serializer._ignoreExtensionDataObject;
+            _rootContract = Volatile.Read(ref serializer._rootContract);
+            _rootName = serializer._rootName;
+            _rootNameRequiresMapping = serializer._rootNameRequiresMapping;
+            _rootType = serializer._rootType;
+            _serializationSurrogateProvider = surrogateProvider;
         }
 
         public bool IgnoreExtensionDataObject
@@ -186,12 +219,14 @@ namespace System.Runtime.Serialization.Json
             [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
             get
             {
-                if (_rootContract == null)
+                DataContract? contract = Volatile.Read(ref _rootContract);
+                if (contract is null)
                 {
-                    _rootContract = DataContract.GetDataContract((_serializationSurrogateProvider == null) ? _rootType : GetSurrogatedType(_serializationSurrogateProvider, _rootType));
-                    CheckIfTypeIsReference(_rootContract);
+                    contract = DataContract.GetDataContract((_serializationSurrogateProvider == null) ? _rootType : GetSurrogatedType(_serializationSurrogateProvider, _rootType));
+                    CheckIfTypeIsReference(contract);
+                    Volatile.Write(ref _rootContract, contract);
                 }
-                return _rootContract;
+                return contract;
             }
         }
 
@@ -257,6 +292,63 @@ namespace System.Runtime.Serialization.Json
             return ReadObjectHandleExceptions(new JsonReaderDelegator(reader, this.DateTimeFormat), true);
         }
 
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task<object?> ReadObjectAsync(XmlReader reader, CancellationToken cancellationToken = default) =>
+            ReadObjectAsync(reader, verifyObjectName: true, cancellationToken);
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task<object?> ReadObjectAsync(XmlDictionaryReader reader, CancellationToken cancellationToken = default) =>
+            ReadObjectAsync(reader, verifyObjectName: true, cancellationToken);
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task<object?> ReadObjectAsync(XmlReader reader, bool verifyObjectName, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(reader);
+            DataContractJsonSerializer snapshot = CreateAsyncOperationSnapshot();
+            return snapshot.ReadObjectHandleExceptionsAsync(new JsonReaderDelegator(reader, snapshot.DateTimeFormat) { CancellationToken = cancellationToken }, verifyObjectName);
+        }
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task<object?> ReadObjectAsync(XmlDictionaryReader reader, bool verifyObjectName, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(reader);
+            DataContractJsonSerializer snapshot = CreateAsyncOperationSnapshot();
+            return snapshot.ReadObjectHandleExceptionsAsync(new JsonReaderDelegator(reader, snapshot.DateTimeFormat) { CancellationToken = cancellationToken }, verifyObjectName);
+        }
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task<object?> ReadObjectAsync(Stream stream, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+            return CreateAsyncOperationSnapshot().ReadObjectFromStreamAsync(stream, cancellationToken);
+        }
+
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        private async Task<object?> ReadObjectFromStreamAsync(Stream stream, CancellationToken cancellationToken)
+        {
+            XmlDictionaryReader reader = await JsonReaderWriterFactory.CreateJsonReaderAsync(
+                new SerializationStream(stream, cancellationToken), null, XmlDictionaryReaderQuotas.Max, null, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await ReadObjectHandleExceptionsAsync(new JsonReaderDelegator(reader, DateTimeFormat) { CancellationToken = cancellationToken }, verifyObjectName: true).ConfigureAwait(false);
+            }
+            finally
+            {
+                await ((XmlBaseReader)reader).CloseAsync().ConfigureAwait(false);
+            }
+        }
+
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
         [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
         public override object? ReadObject(XmlReader reader, bool verifyObjectName)
@@ -286,6 +378,24 @@ namespace System.Runtime.Serialization.Json
             WriteEndObjectHandleExceptions(new JsonWriterDelegator(writer));
         }
 
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task WriteEndObjectAsync(XmlWriter writer, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(writer);
+            return CreateAsyncOperationSnapshot().WriteEndObjectHandleExceptionsAsync(new JsonWriterDelegator(writer) { CancellationToken = cancellationToken });
+        }
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task WriteEndObjectAsync(XmlDictionaryWriter writer, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(writer);
+            return CreateAsyncOperationSnapshot().WriteEndObjectHandleExceptionsAsync(new JsonWriterDelegator(writer) { CancellationToken = cancellationToken });
+        }
+
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
         [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
         public override void WriteEndObject(XmlDictionaryWriter writer)
@@ -305,6 +415,26 @@ namespace System.Runtime.Serialization.Json
             jsonWriter.Flush();
         }
 
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task WriteObjectAsync(Stream stream, object? graph, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+            return CreateAsyncOperationSnapshot().WriteObjectToStreamAsync(stream, graph, cancellationToken);
+        }
+
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        private async Task WriteObjectToStreamAsync(Stream stream, object? graph, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using XmlDictionaryWriter writer = JsonReaderWriterFactory.CreateJsonWriter(
+                new SerializationStream(stream, cancellationToken), Encoding.UTF8, ownsStream: false);
+            await WriteObjectHandleExceptionsAsync(new JsonWriterDelegator(writer, DateTimeFormat) { CancellationToken = cancellationToken }, graph).ConfigureAwait(false);
+            await writer.FlushAsync().ConfigureAwait(false);
+        }
+
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
         [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
         public override void WriteObject(XmlWriter writer, object? graph)
@@ -317,6 +447,26 @@ namespace System.Runtime.Serialization.Json
         public override void WriteObject(XmlDictionaryWriter writer, object? graph)
         {
             WriteObjectHandleExceptions(new JsonWriterDelegator(writer, this.DateTimeFormat), graph);
+        }
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task WriteObjectAsync(XmlWriter writer, object? graph, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(writer);
+            DataContractJsonSerializer snapshot = CreateAsyncOperationSnapshot();
+            return snapshot.WriteObjectHandleExceptionsAsync(new JsonWriterDelegator(writer, snapshot.DateTimeFormat) { CancellationToken = cancellationToken }, graph);
+        }
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task WriteObjectAsync(XmlDictionaryWriter writer, object? graph, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(writer);
+            DataContractJsonSerializer snapshot = CreateAsyncOperationSnapshot();
+            return snapshot.WriteObjectHandleExceptionsAsync(new JsonWriterDelegator(writer, snapshot.DateTimeFormat) { CancellationToken = cancellationToken }, graph);
         }
 
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
@@ -333,6 +483,26 @@ namespace System.Runtime.Serialization.Json
             WriteObjectContentHandleExceptions(new JsonWriterDelegator(writer, this.DateTimeFormat), graph);
         }
 
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task WriteObjectContentAsync(XmlWriter writer, object? graph, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(writer);
+            DataContractJsonSerializer snapshot = CreateAsyncOperationSnapshot();
+            return snapshot.WriteObjectContentHandleExceptionsAsync(new JsonWriterDelegator(writer, snapshot.DateTimeFormat) { CancellationToken = cancellationToken }, graph);
+        }
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task WriteObjectContentAsync(XmlDictionaryWriter writer, object? graph, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(writer);
+            DataContractJsonSerializer snapshot = CreateAsyncOperationSnapshot();
+            return snapshot.WriteObjectContentHandleExceptionsAsync(new JsonWriterDelegator(writer, snapshot.DateTimeFormat) { CancellationToken = cancellationToken }, graph);
+        }
+
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
         [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
         public override void WriteStartObject(XmlWriter writer, object? graph)
@@ -347,6 +517,24 @@ namespace System.Runtime.Serialization.Json
         {
             // No need to pass in DateTimeFormat to JsonWriterDelegator: no DateTimes will be written in start object
             WriteStartObjectHandleExceptions(new JsonWriterDelegator(writer), graph);
+        }
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task WriteStartObjectAsync(XmlWriter writer, object? graph, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(writer);
+            return CreateAsyncOperationSnapshot().WriteStartObjectHandleExceptionsAsync(new JsonWriterDelegator(writer) { CancellationToken = cancellationToken }, graph);
+        }
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task WriteStartObjectAsync(XmlDictionaryWriter writer, object? graph, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(writer);
+            return CreateAsyncOperationSnapshot().WriteStartObjectHandleExceptionsAsync(new JsonWriterDelegator(writer) { CancellationToken = cancellationToken }, graph);
         }
 
         internal static bool CheckIfJsonNameRequiresMapping(string? jsonName)
@@ -446,6 +634,48 @@ namespace System.Runtime.Serialization.Json
             return IsJsonLocalName(reader, RootName.Value);
         }
 
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task<bool> IsStartObjectAsync(XmlReader reader, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(reader);
+            DataContractJsonSerializer snapshot = CreateAsyncOperationSnapshot();
+            return snapshot.IsStartObjectAsyncCore(new JsonReaderDelegator(reader, snapshot.DateTimeFormat), cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        public override Task<bool> IsStartObjectAsync(XmlDictionaryReader reader, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(reader);
+            DataContractJsonSerializer snapshot = CreateAsyncOperationSnapshot();
+            return snapshot.IsStartObjectAsyncCore(new JsonReaderDelegator(reader, snapshot.DateTimeFormat), cancellationToken);
+        }
+
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        private async Task<bool> IsStartObjectAsyncCore(XmlReaderDelegator reader, CancellationToken cancellationToken)
+        {
+            try
+            {
+                if (await reader.MoveToContentAsync(cancellationToken).ConfigureAwait(false) != XmlNodeType.Element)
+                {
+                    return false;
+                }
+                return InternalIsStartObject(reader);
+            }
+            catch (XmlException ex)
+            {
+                throw CreateSerializationException(GetTypeInfoError(SR.ErrorIsStartObject, GetDeserializeType(), ex), ex);
+            }
+            catch (FormatException ex)
+            {
+                throw CreateSerializationException(GetTypeInfoError(SR.ErrorIsStartObject, GetDeserializeType(), ex), ex);
+            }
+        }
+
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
         [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
         internal override object? InternalReadObject(XmlReaderDelegator xmlReader, bool verifyObjectName)
@@ -479,10 +709,57 @@ namespace System.Runtime.Serialization.Json
 
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
         [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        internal override async ValueTask<object?> InternalReadObjectAsync(XmlReaderDelegator reader, bool verifyObjectName, DataContractResolver? dataContractResolver)
+        {
+            if (MaxItemsInObjectGraph == 0)
+            {
+                throw CreateSerializationException(SR.Format(SR.ExceededMaxItemsQuota, MaxItemsInObjectGraph));
+            }
+
+            XmlNodeType nodeType = await reader.MoveToContentAsync(reader.CancellationToken).ConfigureAwait(false);
+            if (verifyObjectName)
+            {
+                if (nodeType != XmlNodeType.Element || !InternalIsStartObject(reader))
+                {
+                    throw CreateSerializationExceptionWithReaderDetails(SR.Format(SR.ExpectingElement, XmlDictionaryString.Empty, RootName), reader);
+                }
+            }
+            else if (nodeType != XmlNodeType.Element)
+            {
+                throw CreateSerializationExceptionWithReaderDetails(SR.Format(SR.ExpectingElementAtDeserialize, XmlNodeType.Element), reader);
+            }
+
+            DataContract contract = RootContract;
+            XmlObjectSerializerReadContextComplexJson context = XmlObjectSerializerReadContextComplexJson.CreateContext(this, contract);
+            context.InitializeAsync(reader, reader.CancellationToken);
+            if (contract.IsPrimitive && ReferenceEquals(contract.UnderlyingType, _rootType))
+            {
+                context.attributes!.Reset();
+                if (!contract.UnderlyingType.IsValueType)
+                {
+                    context.ReadAttributes(reader);
+                    if (context.attributes.XsiNil)
+                    {
+                        await reader.SkipAsync(reader.CancellationToken).ConfigureAwait(false);
+                        return null;
+                    }
+                }
+                return await JsonDataContract.GetJsonDataContract(contract).ReadJsonValueAsync(reader, context, reader.CancellationToken).ConfigureAwait(false);
+            }
+
+            return await context.InternalDeserializeAsync(reader, _rootType, contract, null, null).ConfigureAwait(false);
+        }
+
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
         internal override void InternalWriteEndObject(XmlWriterDelegator writer)
         {
             writer.WriteEndElement();
         }
+
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        internal override Task InternalWriteEndObjectAsync(XmlWriterDelegator writer) => writer.WriteEndElementAsync();
 
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
         [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
@@ -549,6 +826,57 @@ namespace System.Runtime.Serialization.Json
 
         [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
         [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        internal override async Task InternalWriteObjectContentAsync(XmlWriterDelegator writer, object? graph, DataContractResolver? dataContractResolver)
+        {
+            if (MaxItemsInObjectGraph == 0)
+            {
+                throw CreateSerializationException(SR.Format(SR.ExceededMaxItemsQuota, MaxItemsInObjectGraph));
+            }
+
+            DataContract contract = RootContract;
+            Type declaredType = contract.UnderlyingType;
+            Type graphType = graph?.GetType() ?? declaredType;
+            if (_serializationSurrogateProvider is not null)
+            {
+                graph = DataContractSerializer.SurrogateToDataContractType(_serializationSurrogateProvider, graph, declaredType, ref graphType);
+            }
+            if (graph is null)
+            {
+                await writer.WriteAttributeStringAsync(null, JsonGlobals.typeString, null, JsonGlobals.nullString).ConfigureAwait(false);
+                return;
+            }
+
+            XmlObjectSerializerWriteContextComplexJson context = XmlObjectSerializerWriteContextComplexJson.CreateContext(this, RootContract);
+            context.InitializeAsync(writer, writer.CancellationToken);
+            if (declaredType == graphType)
+            {
+                if (contract.CanContainReferences)
+                {
+                    await context.OnHandleReferenceAsync(writer, graph, canContainCyclicReference: true).ConfigureAwait(false);
+                    await context.SerializeWithoutXsiTypeAsync(contract, writer, graph, declaredType.TypeHandle).ConfigureAwait(false);
+                }
+                else
+                {
+                    await JsonDataContract.GetJsonDataContract(contract).WriteJsonValueAsync(
+                        writer, graph, context, declaredType.TypeHandle, writer.CancellationToken).ConfigureAwait(false);
+                }
+                return;
+            }
+
+            contract = GetDataContract(contract, declaredType, graphType);
+            if (contract.CanContainReferences)
+            {
+                await context.OnHandleReferenceAsync(writer, graph, canContainCyclicReference: true).ConfigureAwait(false);
+                await context.SerializeWithXsiTypeAtTopLevelAsync(contract, writer, graph, declaredType.TypeHandle, graphType).ConfigureAwait(false);
+            }
+            else
+            {
+                await context.SerializeWithoutXsiTypeAsync(contract, writer, graph, declaredType.TypeHandle).ConfigureAwait(false);
+            }
+        }
+
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
         internal override void InternalWriteStartObject(XmlWriterDelegator writer, object? graph)
         {
             if (_rootNameRequiresMapping)
@@ -559,6 +887,21 @@ namespace System.Runtime.Serialization.Json
             else
             {
                 writer.WriteStartElement(RootName, XmlDictionaryString.Empty);
+            }
+        }
+
+        [RequiresDynamicCode(DataContract.SerializerAOTWarning)]
+        [RequiresUnreferencedCode(DataContract.SerializerTrimmerWarning)]
+        internal override async Task InternalWriteStartObjectAsync(XmlWriterDelegator writer, object? graph)
+        {
+            if (_rootNameRequiresMapping)
+            {
+                await writer.WriteStartElementAsync("a", JsonGlobals.itemString, JsonGlobals.itemString).ConfigureAwait(false);
+                await writer.WriteAttributeStringAsync(null, JsonGlobals.itemString, null, RootName.Value).ConfigureAwait(false);
+            }
+            else
+            {
+                await writer.WriteStartElementAsync(null, RootName, XmlDictionaryString.Empty).ConfigureAwait(false);
             }
         }
 
